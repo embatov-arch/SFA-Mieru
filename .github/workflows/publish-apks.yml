@@ -1,0 +1,111 @@
+
+name: Publish SFA Mieru APKs
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download successful build 4
+        uses: actions/download-artifact@v4
+        with:
+          name: SFA-Mieru-build-results
+          run-id: 42524392404
+          repository: ${{ github.repository }}
+          github-token: ${{ github.token }}
+          path: source
+
+      - name: Separate APKs by Android architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p apks
+
+          mapfile -d '' -t files < <(
+            find source -type f -name '*.apk' -print0
+          )
+
+          if (( ${#files[@]} == 0 )); then
+            echo "No APK files found"
+            exit 1
+          fi
+
+          for apk in "${files[@]}"; do
+            unzip -tq "$apk" > /dev/null
+
+            mapfile -t abis < <(
+              unzip -Z1 "$apk" |
+              awk -F/ '$1 == "lib" && NF >= 3 {print $2}' |
+              sort -u
+            )
+
+            if (( ${#abis[@]} == 1 )); then
+              variant="${abis[0]}"
+            elif (( ${#abis[@]} > 1 )); then
+              variant="universal"
+            else
+              echo "Cannot identify architecture: $apk"
+              exit 1
+            fi
+
+            case "$variant" in
+              arm64-v8a|armeabi-v7a|x86|x86_64|universal)
+                ;;
+              *)
+                echo "Unexpected architecture: $variant"
+                exit 1
+                ;;
+            esac
+
+            target="apks/SFA-Mieru-1.15-${variant}.apk"
+
+            if [[ -e "$target" ]]; then
+              echo "Duplicate APK architecture: $variant"
+              exit 1
+            fi
+
+            cp "$apk" "$target"
+            echo "Prepared: $target"
+          done
+
+          for variant in \
+            arm64-v8a armeabi-v7a x86 x86_64 universal
+          do
+            test -s "apks/SFA-Mieru-1.15-${variant}.apk"
+          done
+
+          echo "All Android APKs:"
+          ls -lh apks/
+
+      - name: Publish separate APKs on GitHub Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag="sfa-mieru-1.15-alpha13-test"
+
+          if gh release view "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            > /dev/null 2>&1
+          then
+            gh release upload "$tag" apks/*.apk \
+              --clobber \
+              --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$tag" apks/*.apk \
+              --repo "$GITHUB_REPOSITORY" \
+              --target main \
+              --title "SFA 1.15 + Mieru (Test)" \
+              --notes "Unofficial debug build based on official sing-box 1.15.0-alpha.13 with Mieru. Built from successful GitHub Actions run #4. Not yet tested on Android devices." \
+              --prerelease
+          fi
