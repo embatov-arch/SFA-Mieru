@@ -52,11 +52,11 @@ jobs:
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
 
-      - name: Install required Android SDK and NDK
+      - name: Install Android SDK and NDK
         run: |
           sdkmanager 'platforms;android-37.1' 'ndk;28.0.13004108'
 
-      - name: Add only Mieru to the official sing-box core
+      - name: Add Mieru to official sing-box
         run: |
           python3 - <<'PY'
           from pathlib import Path
@@ -65,51 +65,72 @@ jobs:
           core = Path('sing-box')
           source = Path('mbox')
 
-          for name in ('option/mieru.go', 'protocol/mieru/inbound.go', 'protocol/mieru/outbound.go'):
+          files = (
+              'option/mieru.go',
+              'protocol/mieru/inbound.go',
+              'protocol/mieru/outbound.go',
+          )
+
+          for name in files:
               destination = core / name
               if destination.exists():
-                  raise SystemExit(f'Already exists: {name}. Stop to avoid overwriting upstream.')
+                  raise SystemExit(f'Already exists: {name}')
               destination.parent.mkdir(parents=True, exist_ok=True)
               copy2(source / name, destination)
               print('Added', name)
 
-          def replace_exactly_once(relative, old, new):
+          def replace_once(relative, old, new):
               path = core / relative
               data = path.read_text(encoding='utf-8')
               count = data.count(old)
               if count != 1:
-                  raise SystemExit(f'{relative}: expected one anchor, found {count}. Upstream API may have changed.')
-              path.write_text(data.replace(old, new, 1), encoding='utf-8')
-              print('Updated', relative)
+                  raise SystemExit(
+                      f'{relative}: expected one anchor, found {count}'
+                  )
+              path.write_text(
+                  data.replace(old, new, 1),
+                  encoding='utf-8'
+              )
 
-          replace_exactly_once(
+          replace_once(
               'constant/proxy.go',
               '\tTypeAnyTLS             = "anytls"\n',
-              '\tTypeAnyTLS             = "anytls"\n\tTypeMieru              = "mieru"\n',
+              '\tTypeAnyTLS             = "anytls"\n'
+              '\tTypeMieru              = "mieru"\n',
           )
-          replace_exactly_once(
+
+          replace_once(
               'constant/proxy.go',
               '\tcase TypeAnyTLS:\n\t\treturn "AnyTLS"\n',
-              '\tcase TypeAnyTLS:\n\t\treturn "AnyTLS"\n\tcase TypeMieru:\n\t\treturn "Mieru"\n',
+              '\tcase TypeAnyTLS:\n\t\treturn "AnyTLS"\n'
+              '\tcase TypeMieru:\n\t\treturn "Mieru"\n',
           )
-          replace_exactly_once(
+
+          replace_once(
               'include/registry.go',
               '\t"github.com/sagernet/sing-box/protocol/masque"\n',
-              '\t"github.com/sagernet/sing-box/protocol/masque"\n\t"github.com/sagernet/sing-box/protocol/mieru"\n',
+              '\t"github.com/sagernet/sing-box/protocol/masque"\n'
+              '\t"github.com/sagernet/sing-box/protocol/mieru"\n',
           )
-          replace_exactly_once(
+
+          replace_once(
               'include/registry.go',
               '\tanytls.RegisterInbound(registry)\n',
-              '\tanytls.RegisterInbound(registry)\n\tmieru.RegisterInbound(registry)\n',
+              '\tanytls.RegisterInbound(registry)\n'
+              '\tmieru.RegisterInbound(registry)\n',
           )
-          replace_exactly_once(
+
+          replace_once(
               'include/registry.go',
               '\tanytls.RegisterOutbound(registry)\n',
-              '\tanytls.RegisterOutbound(registry)\n\tmieru.RegisterOutbound(registry)\n',
+              '\tanytls.RegisterOutbound(registry)\n'
+              '\tmieru.RegisterOutbound(registry)\n',
           )
+
+          print('Mieru integration applied.')
           PY
 
-      - name: Install Mieru Go library and resolve modules
+      - name: Install Mieru Go dependency
         working-directory: sing-box
         run: |
           go mod edit -require=github.com/enfein/mieru/v3@v3.38.0
@@ -118,17 +139,19 @@ jobs:
           git diff --check
           git status --short
 
-      - name: Compile-test Mieru and the sing-box registries
+      - name: Compile-test Mieru and registry
         working-directory: sing-box
         run: |
           go test ./protocol/mieru ./option ./include
 
-      - name: Check that sing-box recognizes Mieru JSON
+      - name: Check Mieru JSON without Linux Cronet
         working-directory: sing-box
         run: |
           cat > /tmp/mieru-build-check.json <<'JSON'
           {
-            "log": {"level": "warn"},
+            "log": {
+              "level": "warn"
+            },
             "outbounds": [
               {
                 "type": "mieru",
@@ -142,7 +165,11 @@ jobs:
             ]
           }
           JSON
-          go run -tags with_quic,with_wireguard,with_utls,with_naive_outbound,with_clash_api ./cmd/sing-box check -c /tmp/mieru-build-check.json
+
+          go run \
+            -tags with_quic,with_wireguard,with_utls,with_clash_api \
+            ./cmd/sing-box check \
+            -c /tmp/mieru-build-check.json
 
       - name: Install gomobile
         run: |
@@ -152,47 +179,63 @@ jobs:
           gomobile init
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
-      - name: Prepare Android library directory
+      - name: Prepare Android library folder
         run: |
           mkdir -p sing-box-for-android/app/libs
 
-      - name: Build Android libraries from patched official core
+      - name: Build official sing-box Android libraries with Mieru
         working-directory: sing-box
         run: |
           go run ./cmd/internal/build_libbox -target android
 
-      - name: Verify Android libraries and Java bindings
+      - name: Verify Android libraries
         run: |
           set -eu
+
           for file in libbox.aar libbox-legacy.aar; do
             test -s "sing-box-for-android/app/libs/$file"
             echo "Verified $file"
             unzip -l "sing-box-for-android/app/libs/$file" | grep 'classes.jar'
             unzip -l "sing-box-for-android/app/libs/$file" | grep 'arm64-v8a'
           done
-          unzip -p sing-box-for-android/app/libs/libbox.aar classes.jar > /tmp/sfa-libbox-classes.jar
-          jar tf /tmp/sfa-libbox-classes.jar | grep 'io/nekohasekai/libbox/' | head -n 10
+
+          unzip -p \
+            sing-box-for-android/app/libs/libbox.aar \
+            classes.jar > /tmp/sfa-libbox-classes.jar
+
           test -s /tmp/sfa-libbox-classes.jar
 
-      - name: Give test APK a separate application ID
+          jar tf /tmp/sfa-libbox-classes.jar \
+            | grep 'io/nekohasekai/libbox/' \
+            | head -n 10
+
+      - name: Set separate Android application ID
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          p = Path('sing-box-for-android/app/build.gradle.kts')
-          s = p.read_text()
+
+          path = Path('sing-box-for-android/app/build.gradle.kts')
+          data = path.read_text(encoding='utf-8')
+
           old = 'applicationId = "io.nekohasekai.sfa"'
-          if s.count(old) != 1:
-              raise SystemExit('SFA applicationId not found exactly once.')
-          p.write_text(s.replace(old, 'applicationId = "io.nekohasekai.sfa.mieru"'))
+          new = 'applicationId = "io.nekohasekai.sfa.mieru"'
+
+          if data.count(old) != 1:
+              raise SystemExit('Original application ID not found once')
+
+          path.write_text(
+              data.replace(old, new, 1),
+              encoding='utf-8'
+          )
           PY
 
-      - name: Compile SFA Android APK
+      - name: Build SFA Android APK
         working-directory: sing-box-for-android
         run: |
           chmod +x gradlew
           ./gradlew :app:assembleOtherDebug --no-daemon
 
-      - name: Upload debug APK and compiler logs
+      - name: Upload APK and build reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
