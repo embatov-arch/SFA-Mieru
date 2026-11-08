@@ -1,0 +1,64 @@
+
+name: Build SFA with Mieru
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27'
+          cache: false
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android SDK packages
+        run: |
+          sdkmanager "platforms;android-37.1" "ndk;28.0.13004108"
+
+      - name: Download sources
+        run: |
+          git clone --depth 1 --recurse-submodules --branch v5 https://github.com/hiddify/hiddify-sing-box.git
+          git clone --depth 1 --branch dev https://github.com/SagerNet/sing-box-for-android.git
+
+      - name: Install gomobile
+        run: |
+          go install github.com/sagernet/gomobile/cmd/gomobile@v0.1.13
+          go install github.com/sagernet/gomobile/cmd/gobind@v0.1.13
+          "$(go env GOPATH)/bin/gomobile" init
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Build Hiddify sing-box
+        working-directory: hiddify-sing-box
+        run: |
+          go run ./cmd/internal/build_libbox -target android
+
+      - name: Change application ID
+        run: |
+          sed -i 's/applicationId = "io.nekohasekai.sfa"/applicationId = "io.nekohasekai.sfa.mieru"/' sing-box-for-android/app/build.gradle.kts
+
+      - name: Build SFA APK
+        working-directory: sing-box-for-android
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assembleOtherDebug --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: SFA-Mieru-APK
+          path: sing-box-for-android/app/build/outputs/apk/other/debug/*.apk
+          if-no-files-found: error
