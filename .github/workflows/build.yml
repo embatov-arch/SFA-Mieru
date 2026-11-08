@@ -31,24 +31,50 @@ jobs:
 
       - name: Download sources
         run: |
-          git clone --depth 1 --recurse-submodules --branch v5 https://github.com/hiddify/hiddify-sing-box.git
-          git clone --depth 1 --branch dev https://github.com/SagerNet/sing-box-for-android.git
+          git clone --depth 1 --recurse-submodules \
+            --branch v5 \
+            https://github.com/hiddify/hiddify-sing-box.git
+
+          git clone --depth 1 \
+            --branch dev \
+            https://github.com/SagerNet/sing-box-for-android.git
+
+      - name: Prepare SFA library directory
+        run: |
+          mkdir -p sing-box-for-android/app/libs
 
       - name: Install gomobile
         run: |
           go install github.com/sagernet/gomobile/cmd/gomobile@v0.1.13
           go install github.com/sagernet/gomobile/cmd/gobind@v0.1.13
-          "$(go env GOPATH)/bin/gomobile" init
+
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          gomobile init
+
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
-      - name: Build Hiddify sing-box
+      - name: Build Hiddify sing-box with Mieru
         working-directory: hiddify-sing-box
         run: |
           go run ./cmd/internal/build_libbox -target android
 
+      - name: Verify and copy libbox
+        run: |
+          if [ ! -s sing-box-for-android/app/libs/libbox.aar ]; then
+            cp -v hiddify-sing-box/libbox.aar \
+              sing-box-for-android/app/libs/libbox.aar
+          fi
+
+          test -s sing-box-for-android/app/libs/libbox.aar
+
+          echo "Hiddify libbox successfully installed:"
+          ls -lh sing-box-for-android/app/libs/libbox.aar
+
       - name: Change application ID
         run: |
-          sed -i 's/applicationId = "io.nekohasekai.sfa"/applicationId = "io.nekohasekai.sfa.mieru"/' sing-box-for-android/app/build.gradle.kts
+          sed -i \
+            's/applicationId = "io.nekohasekai.sfa"/applicationId = "io.nekohasekai.sfa.mieru"/' \
+            sing-box-for-android/app/build.gradle.kts
 
       - name: Build SFA APK
         working-directory: sing-box-for-android
@@ -62,3 +88,4 @@ jobs:
           name: SFA-Mieru-APK
           path: sing-box-for-android/app/build/outputs/apk/other/debug/*.apk
           if-no-files-found: error
+          retention-days: 7
