@@ -1,8 +1,11 @@
 
-name: Build SFA with Mieru
+name: Build SFA 1.15 with Mieru
 
 on:
   workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build:
@@ -10,82 +13,192 @@ jobs:
     timeout-minutes: 120
 
     steps:
-      - name: Set up Java
+      - name: Get official sing-box 1.15.0-alpha.13
+        uses: actions/checkout@v4
+        with:
+          repository: SagerNet/sing-box
+          ref: 824dbcfb4dd0a95921840b1737b950cde590241e
+          path: sing-box
+          persist-credentials: false
+
+      - name: Get Mieru implementation from its author
+        uses: actions/checkout@v4
+        with:
+          repository: enfein/mbox
+          ref: 1c5b39718ebcd05e6adb31f95246fbf056be9bd7
+          path: mbox
+          persist-credentials: false
+
+      - name: Get official SFA Android application
+        uses: actions/checkout@v4
+        with:
+          repository: SagerNet/sing-box-for-android
+          ref: a548a7903e96266a0046018562c73b192edbfc18
+          path: sing-box-for-android
+          persist-credentials: false
+
+      - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Go
+      - name: Set up Go 1.25.5
         uses: actions/setup-go@v5
         with:
-          go-version: '1.27'
+          go-version: '1.25.5'
           cache: false
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
 
-      - name: Install Android SDK packages
+      - name: Install required Android SDK and NDK
         run: |
-          sdkmanager "platforms;android-37.1" "ndk;28.0.13004108"
+          sdkmanager 'platforms;android-37.1' 'ndk;28.0.13004108'
 
-      - name: Download sources
+      - name: Add only Mieru to the official sing-box core
         run: |
-          git clone --depth 1 --recurse-submodules \
-            --branch v5 \
-            https://github.com/hiddify/hiddify-sing-box.git
+          python3 - <<'PY'
+          from pathlib import Path
+          from shutil import copy2
 
-          git clone --depth 1 \
-            --branch dev \
-            https://github.com/SagerNet/sing-box-for-android.git
+          core = Path('sing-box')
+          source = Path('mbox')
 
-      - name: Prepare SFA library directory
+          for name in ('option/mieru.go', 'protocol/mieru/inbound.go', 'protocol/mieru/outbound.go'):
+              destination = core / name
+              if destination.exists():
+                  raise SystemExit(f'Already exists: {name}. Stop to avoid overwriting upstream.')
+              destination.parent.mkdir(parents=True, exist_ok=True)
+              copy2(source / name, destination)
+              print('Added', name)
+
+          def replace_exactly_once(relative, old, new):
+              path = core / relative
+              data = path.read_text(encoding='utf-8')
+              count = data.count(old)
+              if count != 1:
+                  raise SystemExit(f'{relative}: expected one anchor, found {count}. Upstream API may have changed.')
+              path.write_text(data.replace(old, new, 1), encoding='utf-8')
+              print('Updated', relative)
+
+          replace_exactly_once(
+              'constant/proxy.go',
+              '\tTypeAnyTLS             = "anytls"\n',
+              '\tTypeAnyTLS             = "anytls"\n\tTypeMieru              = "mieru"\n',
+          )
+          replace_exactly_once(
+              'constant/proxy.go',
+              '\tcase TypeAnyTLS:\n\t\treturn "AnyTLS"\n',
+              '\tcase TypeAnyTLS:\n\t\treturn "AnyTLS"\n\tcase TypeMieru:\n\t\treturn "Mieru"\n',
+          )
+          replace_exactly_once(
+              'include/registry.go',
+              '\t"github.com/sagernet/sing-box/protocol/masque"\n',
+              '\t"github.com/sagernet/sing-box/protocol/masque"\n\t"github.com/sagernet/sing-box/protocol/mieru"\n',
+          )
+          replace_exactly_once(
+              'include/registry.go',
+              '\tanytls.RegisterInbound(registry)\n',
+              '\tanytls.RegisterInbound(registry)\n\tmieru.RegisterInbound(registry)\n',
+          )
+          replace_exactly_once(
+              'include/registry.go',
+              '\tanytls.RegisterOutbound(registry)\n',
+              '\tanytls.RegisterOutbound(registry)\n\tmieru.RegisterOutbound(registry)\n',
+          )
+          PY
+
+      - name: Install Mieru Go library and resolve modules
+        working-directory: sing-box
         run: |
-          mkdir -p sing-box-for-android/app/libs
+          go mod edit -require=github.com/enfein/mieru/v3@v3.38.0
+          go mod tidy
+          gofmt -w option/mieru.go protocol/mieru/inbound.go protocol/mieru/outbound.go
+          git diff --check
+          git status --short
+
+      - name: Compile-test Mieru and the sing-box registries
+        working-directory: sing-box
+        run: |
+          go test ./protocol/mieru ./option ./include
+
+      - name: Check that sing-box recognizes Mieru JSON
+        working-directory: sing-box
+        run: |
+          cat > /tmp/mieru-build-check.json <<'JSON'
+          {
+            "log": {"level": "warn"},
+            "outbounds": [
+              {
+                "type": "mieru",
+                "tag": "test-mieru",
+                "server": "127.0.0.1",
+                "server_port": 29999,
+                "transport": "TCP",
+                "username": "test-user",
+                "password": "test-password"
+              }
+            ]
+          }
+          JSON
+          go run -tags with_quic,with_wireguard,with_utls,with_naive_outbound,with_clash_api ./cmd/sing-box check -c /tmp/mieru-build-check.json
 
       - name: Install gomobile
         run: |
           go install github.com/sagernet/gomobile/cmd/gomobile@v0.1.13
           go install github.com/sagernet/gomobile/cmd/gobind@v0.1.13
-
           export PATH="$(go env GOPATH)/bin:$PATH"
           gomobile init
-
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
-      - name: Build Hiddify sing-box with Mieru
-        working-directory: hiddify-sing-box
+      - name: Prepare Android library directory
+        run: |
+          mkdir -p sing-box-for-android/app/libs
+
+      - name: Build Android libraries from patched official core
+        working-directory: sing-box
         run: |
           go run ./cmd/internal/build_libbox -target android
 
-      - name: Verify and copy libbox
+      - name: Verify Android libraries and Java bindings
         run: |
-          if [ ! -s sing-box-for-android/app/libs/libbox.aar ]; then
-            cp -v hiddify-sing-box/libbox.aar \
-              sing-box-for-android/app/libs/libbox.aar
-          fi
+          set -eu
+          for file in libbox.aar libbox-legacy.aar; do
+            test -s "sing-box-for-android/app/libs/$file"
+            echo "Verified $file"
+            unzip -l "sing-box-for-android/app/libs/$file" | grep 'classes.jar'
+            unzip -l "sing-box-for-android/app/libs/$file" | grep 'arm64-v8a'
+          done
+          unzip -p sing-box-for-android/app/libs/libbox.aar classes.jar > /tmp/sfa-libbox-classes.jar
+          jar tf /tmp/sfa-libbox-classes.jar | grep 'io/nekohasekai/libbox/' | head -n 10
+          test -s /tmp/sfa-libbox-classes.jar
 
-          test -s sing-box-for-android/app/libs/libbox.aar
-
-          echo "Hiddify libbox successfully installed:"
-          ls -lh sing-box-for-android/app/libs/libbox.aar
-
-      - name: Change application ID
+      - name: Give test APK a separate application ID
         run: |
-          sed -i \
-            's/applicationId = "io.nekohasekai.sfa"/applicationId = "io.nekohasekai.sfa.mieru"/' \
-            sing-box-for-android/app/build.gradle.kts
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('sing-box-for-android/app/build.gradle.kts')
+          s = p.read_text()
+          old = 'applicationId = "io.nekohasekai.sfa"'
+          if s.count(old) != 1:
+              raise SystemExit('SFA applicationId not found exactly once.')
+          p.write_text(s.replace(old, 'applicationId = "io.nekohasekai.sfa.mieru"'))
+          PY
 
-      - name: Build SFA APK
+      - name: Compile SFA Android APK
         working-directory: sing-box-for-android
         run: |
           chmod +x gradlew
           ./gradlew :app:assembleOtherDebug --no-daemon
 
-      - name: Upload APK
+      - name: Upload debug APK and compiler logs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: SFA-Mieru-APK
-          path: sing-box-for-android/app/build/outputs/apk/other/debug/*.apk
-          if-no-files-found: error
+          name: SFA-Mieru-build-results
+          path: |
+            sing-box-for-android/app/build/outputs/apk/other/debug/*.apk
+            sing-box-for-android/build/reports/problems/**
+          if-no-files-found: warn
           retention-days: 7
